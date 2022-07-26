@@ -1,10 +1,9 @@
 #include <thread>
 #include <condition_variable>
 #include <vector>
-#include <list>
 #include <queue>
 #include <algorithm>
-#include <chrono>
+#include <chrono>		// for profiling
 
 using namespace std;
 using namespace std::chrono;
@@ -13,10 +12,9 @@ using namespace std::chrono;
 
 struct search_engine
 {
+	// sample: search("f:\\abc.txt","?ad", 8)
 	bool search(const string& path, const string& mask, size_t num_threads)
 	{
-		m_mask = mask;
-
 		FILE* f = fopen(path.c_str(), "rb");
 		if (!f)
 		{
@@ -30,13 +28,23 @@ struct search_engine
 			return false;
 		}
 
+		// Маска не может содержать символа перевода строки
+		if (strchr(mask.c_str(), '\n'))
+		{
+			printf("Mask cannot contain EOL\n");
+			return false;
+		}
+
+		m_mask = mask;
+		printf("Searching started, path %s, mask '%s'\n", path.c_str(), m_mask.c_str());
+
 		milliseconds start_ms = duration_cast<milliseconds>(system_clock::now().time_since_epoch());
 
 		// start threads
-		threads.reserve(num_threads);
+		m_threads.reserve(num_threads);
 		for (size_t i = 0; i < num_threads; ++i)
 		{
-			threads.emplace_back(&search_engine::thread_func, this, i);
+			m_threads.emplace_back(&search_engine::thread_func, this, i);
 		}
 
 		size_t readbuf_size = 1024 * 1024;		// 1mb
@@ -83,6 +91,7 @@ struct search_engine
 		milliseconds end_ms = duration_cast<milliseconds>(system_clock::now().time_since_epoch());
 		milliseconds t = end_ms - start_ms;
 		printf("elapsed time %zdms\n", t.count());
+		printf("Searching ended\n");
 		return true;
 	}
 
@@ -90,13 +99,11 @@ struct search_engine
 	{
 		// sort on line & pos
 		printf("%zd matches\n", m_result.size());
-		//		printf("*** sorting...\n");
 		sort(m_result.begin(), m_result.end(), [](const thread_result& a, const thread_result& b)->bool
 			{
 				return ((a.line < b.line) || (a.line == b.line && a.pos < b.pos));
 			});
 
-		//		printf("*** printing...\n");
 		for (size_t i = 0; i < m_result.size(); i++)
 		{
 			const thread_result& r = m_result[i];
@@ -113,14 +120,15 @@ private:
 	void wait_completition()
 	{
 		m_quit = true;
-		q_cv.notify_all();
+		m_taskcv.notify_all();
 
-		for (uint32_t i = 0; i < threads.size(); ++i)
+		for (uint32_t i = 0; i < m_threads.size(); ++i)
 		{
-			threads[i].join();
+			m_threads[i].join();
 		}
 	}
 
+	// find search string
 	bool test_mask(const char* buf)
 	{
 		for (size_t i = 0; i < m_mask.size(); i++)
@@ -135,28 +143,27 @@ private:
 
 	void thread_func(size_t thread_index)
 	{
-		//printf("thread %zd started\n", thread_index);
 		while (1)
 		{
-			unique_lock<mutex> lock(q_mtx);
-			q_cv.wait(lock, [this]()->bool { return !q.empty() || m_quit; });
+			// wait for task
+			unique_lock<mutex> lock(m_task_mutex);
+			m_taskcv.wait(lock, [this]()->bool { return !m_tasks.empty() || m_quit; });
 
-			if (q.empty())
+			if (m_tasks.empty())
 			{
 				break;
 			}
 			else
 			{
-				auto txt = q.front();
-				q.pop();
+				auto txt = m_tasks.front();
+				m_tasks.pop();
 				lock.unlock();
 
-				// test mask
+				// searching mask in the chunk
 				const char* buf = txt.buf.get() + txt.offset;
 				size_t line = txt.line;
 				size_t pos = txt.pos;
 
-				//	printf("line %zd, pos %zd, %zd: %.*s\n", line, pos, txt.chunksize, (int)(txt.chunksize), buf);
 				for (size_t i = 0; i < txt.chunksize; i++, buf++, pos++)
 				{
 					if (*buf == '\n')
@@ -168,7 +175,9 @@ private:
 					{
 						if (txt.chunksize - i >= masksize() && test_mask(buf))
 						{
+							// lock m_result 
 							lock_guard<mutex> lock(m_result_mutex);
+
 							m_result.push_back(thread_result());
 							auto& b = m_result.back();
 							b.line = line + 1;
@@ -187,10 +196,10 @@ private:
 		if (chunksize > 0)
 		{
 			{
-				lock_guard<mutex> q_lock(q_mtx);
-				q.push({ buf, line, pos, offset, chunksize });
+				lock_guard<mutex> q_lock(m_task_mutex);
+				m_tasks.push({ buf, line, pos, offset, chunksize });
 			}
-			q_cv.notify_one();
+			m_taskcv.notify_one();
 
 			if (chunksize > overlap())
 			{
@@ -224,29 +233,31 @@ private:
 		size_t chunksize;
 	};
 
-
+	// search result
 	struct thread_result
 	{
 		size_t line;
 		size_t pos;
 		char txt[MAX_MASK_SIZE + 1];
 	};
+
+	atomic<bool> m_quit{ false };
+	string m_mask;
+	vector<thread> m_threads;
+
+	mutex m_result_mutex;
 	vector<thread_result> m_result;
 
-	vector<thread> threads;
-	queue<thread_task> q;
-	atomic<bool> m_quit{ false };
-	mutex q_mtx;
-	condition_variable q_cv;
-	string m_mask;
-	mutex m_result_mutex;
+	mutex m_task_mutex;
+	queue<thread_task> m_tasks;
+	condition_variable m_taskcv;
 };
 
 int main(int argc, char* argv[])
 {
 	if (argc < 3)
 	{
-		printf("Usage: optimacros.exe <path-to-text-file> <mask>\n");
+		printf("Usage: mtfind <path-to-text-file> <mask>\n");
 		return -1;
 	}
 
